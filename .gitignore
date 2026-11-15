@@ -1,0 +1,6 @@
+/.build/
+/.venv/
+/delivery/
+/verification/
+/__pycache__/
+/dashboard.png

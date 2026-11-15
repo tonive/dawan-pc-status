@@ -1,0 +1,7 @@
+{
+  "app_id": "dawan_pc_status",
+  "abi": "0x00010006",
+  "sources": ["app.c", "crypto.c", "memory.c"],
+  "required_host_features": ["host-info-v1", "service-environment-v1", "app-scoped-storage-v1", "random-bytes-v1", "text-emphasis-v1"],
+  "required_extensions": 0
+}
