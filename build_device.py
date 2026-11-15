@@ -31,7 +31,7 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="pc-status-src-", dir=out.parent) as temporary:
         staged = Path(temporary)
-        for name in (*config["sources"], "app.json", "crypto.h"):
+        for name in (*config["sources"], "app.json", "crypto.h", "theme.h"):
             shutil.copyfile(project / name, staged / name)
         app = staged / "app.c"
         source = app.read_text(encoding="utf-8")

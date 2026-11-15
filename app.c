@@ -1,5 +1,6 @@
 #include "dawan_streaming.h"
 #include "crypto.h"
+#include "theme.h"
 
 __attribute__((section(".dawan"), used, retain))
 static const dawan_module_info module = {
@@ -10,7 +11,6 @@ static const dawan_module_info module = {
 #define API "/wm-pc/v1/"
 #define PEER_LIMIT 5
 #define INK 0x25243a
-#define SKY 0x82dafa
 #define CREAM 0xfff4d9
 #define PAPER 0xfff9e9
 #define PANEL 0x3a5279
@@ -20,16 +20,18 @@ static const dawan_module_info module = {
 #define ACTION_GREEN 0x26794e
 #define ACTION_GOLD 0xffcd5b
 #define DANGER 0xa83932
-#define UI_CAPACITY 240u
+#define UI_CAPACITY 288u
 #ifndef PC_LAN_SEED
 #define PC_LAN_SEED ""
 #endif
 
-enum page { DASHBOARD, CONNECT, DISCOVERY, PAIR, CONFIRM };
-enum job_kind { NONE, ENVIRONMENT, LOAD_ADDRESS, SAVE_ADDRESS, PROBE, STATUS, CHALLENGE, SHUTDOWN };
+enum page { DASHBOARD, CONNECT, DISCOVERY, PAIR, CONFIRM, THEMES, THEME_PREVIEW };
+enum job_kind { NONE, ENVIRONMENT, LOAD_ADDRESS, SAVE_ADDRESS, PROBE, STATUS, CHALLENGE, SHUTDOWN,
+                LOAD_THEME, CHECK_THEME, FETCH_THEME, SAVE_THEME };
 enum action {
     EXIT = 1, SETTINGS, BACK, ERASE, DIRECT, SEARCH, MANUAL, SELECT_PEER = 16,
-    KEY = 32, EDIT_CODE = 70, APPLY_CODE, ASK_SHUTDOWN, DO_SHUTDOWN
+    KEY = 32, EDIT_CODE = 70, APPLY_CODE, ASK_SHUTDOWN, DO_SHUTDOWN,
+    OPEN_THEMES, GET_THEME, INSTALL_THEME, RESET_THEME, PREVIEW_THEME
 };
 enum metric { CPU, MEMORY, USED, TOTAL, DISK, FREE, RX, TX, UPTIME, GPU, TEMP, CAN_SHUTDOWN, METRIC_COUNT };
 
@@ -43,16 +45,19 @@ static struct {
     unsigned nodes_used, revision, tries, scan, probes, peers, input_length, key_length, target, submitted_target;
     unsigned canvas_width, status_failures;
     unsigned subnet[3];
-    enum page screen;
-    enum job_kind pending;
-    uint64_t serial, active, due, confirm_until, discover_due;
+    enum page screen, presented_screen, previous_screen;
+    enum job_kind pending, theme_job;
+    uint64_t serial, active, due, confirm_until, discover_due, theme_due;
     int64_t clock_epoch;
     bool presented, reported_metrics, dirty, stopping, have_address, ready, environment_error;
     bool load, save, scanning, auto_select, fresh, challenge, send_shutdown, control_sent;
     char ip[16], input[16], name[49], key[PC_KEY_LENGTH + 1];
     char client[PC_NONCE_LENGTH + 1], server[PC_NONCE_LENGTH + 1];
     char response[1025], date[11], time[9];
-    const char *storage_key, *message;
+    const char *storage_key, *message, *theme_key, *theme_message;
+    pc_theme installed_theme, preview_theme;
+    char theme_wire[THEME_WIRE_MAX + 1], installed_wire[THEME_WIRE_MAX + 1];
+    bool custom_theme, reset_theme, offered_theme;
     peer found[PEER_LIMIT];
     int metrics[METRIC_COUNT];
 } state;
@@ -86,6 +91,11 @@ static char *number(char *out, unsigned value) {
 static bool starts(const char *text, const char *prefix) {
     while (*prefix) if (*text++ != *prefix++) return false;
     return true;
+}
+
+static bool same_theme_offer(void) {
+    return state.offered_theme && length(state.theme_wire) == length(state.installed_wire) &&
+           starts(state.theme_wire, state.installed_wire);
 }
 
 static dawan_ui_node *node(unsigned parent, unsigned kind, int x, int y, int w, int h) {
@@ -139,8 +149,9 @@ static void cloud(int x, int y) {
     box(1, x + 20, y, 15, 4, 0xf4fbfb, 0);
 }
 
-static void world(void) {
-    box(0, 0, 0, 480, 480, SKY, 0);
+static void world(const pc_theme *theme) {
+    box(0, 0, 0, 480, 480, theme->background, 0);
+    if (theme->style == PANEL_STYLE) return;
     cloud(3, 75);
     cloud(419, 26);
     box(1, 0, 397, 480, 83, 0xb96a43, 0);
@@ -152,7 +163,7 @@ static void world(void) {
 }
 
 static void title(const char *name, const char *back, unsigned action) {
-    world();
+    world(&builtin_theme);
     framed_box(1, 12, 72, 456, 395, CREAM);
     label(1, 22, 19, 323, 48, 29, TEXT, DAWAN_TEXT_BOLD, name);
     button(365, 19, 91, 46, back, PANEL, action);
@@ -167,7 +178,6 @@ static void format_value(char *out, int value, const char *unit) {
     else append(number(out, (unsigned)value), unit);
 }
 
-enum tile_art { MUSHROOM, FLOWER, PIPE, COIN };
 static const char icons[][8][9] = {
     {
         "..kkkk..", ".krrrrk.", "krrwwrrk", "krwwrrrk",
@@ -187,15 +197,19 @@ static const char icons[][8][9] = {
     },
 };
 
-static void tile_icon(unsigned parent, int x, int y, enum tile_art which) {
+static void tile_icon(unsigned parent, int x, int y, const theme_card *card) {
+    if (card->icon == NO_ICON) return;
+    bool custom = card->icon == CUSTOM_ICON;
     for (unsigned row = 0; row < 8; ++row) {
-        const char *line = icons[which][row];
+        const char *line = custom ? card->icon_pixels + row * 8 : icons[card->icon][row];
         for (unsigned first = 0, end; first < 8; first = end) {
             char pixel = line[first];
             end = first + 1;
             while (end < 8 && line[end] == pixel) ++end;
+            if (pixel == '.') continue;
             unsigned color;
-            switch (pixel) {
+            if (custom) color = card->icon_colors[pixel - '1'];
+            else switch (pixel) {
                 case 'k': color = INK; break;
                 case 'r': color = 0xe4503d; break;
                 case 'g': color = 0x3ca654; break;
@@ -210,59 +224,108 @@ static void tile_icon(unsigned parent, int x, int y, enum tile_art which) {
     }
 }
 
-static void meter(unsigned parent, int level, unsigned color) {
+static unsigned themed_box(const pc_theme *theme, int x, int y, int w, int h) {
+    unsigned id = box(1, x, y, w, h, theme->surface, theme->style == PANEL_STYLE ? 10 : 0);
+    state.nodes[id - 1].border = theme->outline;
+    state.nodes[id - 1].border_width = theme->style == PANEL_STYLE ? 1 : 2;
+    return id;
+}
+
+static void meter(unsigned parent, const pc_theme *theme, int x, int y, int width, int level, unsigned color) {
+    unsigned track = theme == &builtin_theme ? 0xe7d9ba : theme->outline;
+    if (theme->meter == SOLID_METER) {
+        box(parent, x, y, width, 8, track, 2);
+        if (level > 0 && width * level / 100 > 0)
+            box(parent, x, y, width * level / 100, 8, color, 2);
+        return;
+    }
+    int step = width / 10;
     for (int segment = 0; segment < 10; ++segment) {
-        unsigned fill = level >= 0 && (level + 5) / 10 > segment ? color : 0xe7d9ba;
-        box(parent, 12 + segment * 19, 86, 16, 10, fill, 0);
+        unsigned fill = level >= 0 && (level + 5) / 10 > segment ? color : track;
+        box(parent, x + segment * step, y, step - 3, 10, fill, 0);
     }
 }
 
-static void metric_card(int x, int y, const char *title_text, const char *value, const char *detail,
-                        int level, unsigned banner, unsigned accent, enum tile_art art) {
-    box(1, x + 3, y + 4, 216, 104, 0x4596ba, 0);
-    unsigned card = framed_box(1, x, y, 216, 104, PAPER);
-    box(card, 3, 3, 210, 30, banner, 0);
-    label(card, 12, 5, 154, 27, 18, TEXT, DAWAN_TEXT_BOLD, title_text);
-    tile_icon(card, 179, 6, art);
-    label(card, 12, 35, 193, 32, 30, accent, DAWAN_TEXT_BOLD, value);
-    label(card, 12, 67, 193, 18, 15, MUTED, 0, detail);
-    meter(card, level, accent);
+static int readings(unsigned metric_id, const char **title_text, char value[44], char detail[147]) {
+    static const enum metric fields[] = {CPU, GPU, MEMORY, DISK};
+    static const char *const titles[] = {"CPU", "GPU", "内存", "系统盘"};
+    int level = metric(fields[metric_id]);
+    *title_text = titles[metric_id];
+    format_value(value, level, "%");
+    switch (metric_id) {
+        case THEME_CPU: append(detail, "处理器使用率"); break;
+        case THEME_GPU: format_value(append(detail, "温度 "), metric(TEMP), " °C"); break;
+        case THEME_MEMORY:
+            if (state.fresh) {
+                char *end = append(number(detail, state.metrics[USED] / 1024u), " / ");
+                append(number(end, state.metrics[TOTAL] / 1024u), " GiB");
+            } else append(detail, "物理内存");
+            break;
+        case THEME_DISK:
+            format_value(append(detail, "可用 "), state.fresh ? state.metrics[FREE] / 1024 : -1, " GiB");
+            break;
+    }
+    return level;
+}
+
+static void metric_card(const pc_theme *theme, unsigned index) {
+    const theme_card *item = &theme->cards[index];
+    const char *title_text;
+    char value[44], detail[147];
+    int level = readings(item->metric, &title_text, value, detail);
+    if (theme->layout != GRID_LAYOUT) {
+        bool featured = theme->layout == HERO_LAYOUT && index == 0;
+        int y = theme->layout == ROW_LAYOUT ? 99 + (int)index * 57
+              : featured ? 99 : 174 + ((int)index - 1) * 52;
+        int height = featured ? 67 : 50;
+        unsigned row = themed_box(theme, 16, y, 448, height);
+        box(row, 3, 3, featured ? 175 : 145, featured ? 38 : 29, item->banner, 0);
+        tile_icon(row, 9, featured ? 9 : 5, item);
+        label(row, 41, featured ? 7 : 4, featured ? 132 : 103, featured ? 32 : 27,
+              featured ? 22 : 17, theme->ink, DAWAN_TEXT_BOLD, title_text);
+        label(row, featured ? 186 : 157, featured ? 9 : 4, featured ? 153 : 180, 27, 15, theme->muted, 0, detail);
+        label(row, 350, featured ? 5 : 3, 91, featured ? 43 : 34,
+              featured ? 30 : 25, item->accent, DAWAN_TEXT_BOLD, value);
+        meter(row, theme, 12, featured ? 50 : 35, 424, level, item->accent);
+        return;
+    }
+    int x = 16 + (int)(index % 2) * 232, y = 99 + (int)(index / 2) * 116;
+    if (theme->style == PIXEL_WORLD)
+        box(1, x + 3, y + 4, 216, 104, 0x4596ba, 0);
+    unsigned card = themed_box(theme, x, y, 216, 104);
+    box(card, 3, 3, 210, 30, item->banner, 0);
+    label(card, 12, 5, 154, 27, 18, theme->ink, DAWAN_TEXT_BOLD, title_text);
+    tile_icon(card, 179, 6, item);
+    label(card, 12, 35, 193, 32, 30, item->accent, DAWAN_TEXT_BOLD, value);
+    label(card, 12, 67, 193, 18, 15, theme->muted, 0, detail);
+    meter(card, theme, 12, 86, 190, level, item->accent);
 }
 
 static void dashboard(void) {
-    char value[44], detail[147], context[112];
-    world();
-    unsigned heading = framed_box(1, 16, 15, 448, 73, CREAM);
-    box(heading, 15, 10, 3, 33, INK, 0);
-    box(heading, 18, 11, 21, 13, 0xe4503d, 0);
-    box(heading, 18, 24, 12, 3, 0xb53932, 0);
-    box(heading, 11, 43, 11, 3, INK, 0);
-    label(heading, 50, 5, 327, 43, 30, TEXT, DAWAN_TEXT_BOLD, "电脑状态");
-    label(heading, 15, 46, 224, 21, 15, MUTED, 0, state.date[0] ? state.date : "----/--/--");
-    label(heading, 339, 46, 100, 21, 15, MUTED, 0, state.time[0] ? state.time : "--:--:--");
-    box(heading, 403, 16, 22, 5, ACTION_GOLD, 0);
-    box(heading, 399, 21, 30, 5, ACTION_GOLD, 0);
-    box(heading, 403, 26, 22, 5, 0xe39a3f, 0);
-
-    format_value(value, metric(CPU), "%");
-    metric_card(16, 99, "CPU", value, "处理器使用率", metric(CPU), 0xffd3af, 0xa73b2d, MUSHROOM);
-    format_value(value, metric(GPU), "%");
-    format_value(append(detail, "温度 "), metric(TEMP), " °C");
-    metric_card(248, 99, "GPU", value, detail, metric(GPU), 0xffde9d, 0x985013, FLOWER);
-
-    format_value(value, metric(MEMORY), "%");
-    if (state.fresh) {
-        char *end = append(number(detail, state.metrics[USED] / 1024u), " / ");
-        append(number(end, state.metrics[TOTAL] / 1024u), " GiB");
-    } else append(detail, "物理内存");
-    metric_card(16, 215, "内存", value, detail, metric(MEMORY), 0xcce7a1, 0x216c3b, PIPE);
-
-    format_value(value, metric(DISK), "%");
-    format_value(append(detail, "可用 "), state.fresh ? state.metrics[FREE] / 1024 : -1, " GiB");
-    metric_card(248, 215, "系统盘", value, detail, metric(DISK), 0xffe0a0, 0x875a16, COIN);
+    bool preview = state.screen == THEME_PREVIEW;
+    const pc_theme *theme = preview ? &state.preview_theme : state.custom_theme ? &state.installed_theme : &builtin_theme;
+    char detail[147], context[112];
+    world(theme);
+    unsigned heading = themed_box(theme, 16, 15, 448, 73);
+    if (theme->style == PIXEL_WORLD) {
+        box(heading, 15, 10, 3, 33, theme->outline, 0);
+        box(heading, 18, 11, 21, 13, 0xe4503d, 0);
+        box(heading, 18, 24, 12, 3, 0xb53932, 0);
+        box(heading, 11, 43, 11, 3, theme->outline, 0);
+        box(heading, 403, 16, 22, 5, ACTION_GOLD, 0);
+        box(heading, 399, 21, 30, 5, ACTION_GOLD, 0);
+        box(heading, 403, 26, 22, 5, 0xe39a3f, 0);
+    }
+    label(heading, 50, 5, 340, 43, 27, theme->ink, DAWAN_TEXT_BOLD, theme->title);
+    label(heading, 15, 46, 224, 21, 15, theme->muted, 0, state.date[0] ? state.date : "----/--/--");
+    label(heading, 339, 46, 100, 21, 15, theme->muted, 0, state.time[0] ? state.time : "--:--:--");
+    for (unsigned i = 0; i < THEME_CARD_COUNT; ++i) metric_card(theme, i);
 
     const char *status = "等待自动发现上位机";
-    if (state.environment_error) status = "当前系统缺少服务环境支持";
+    if (preview) {
+        append(append(context, "预览 · "), theme->name);
+        status = state.theme_message ? state.theme_message : context;
+    } else if (state.environment_error) status = "当前系统缺少服务环境支持";
     else if (!state.ready) status = "读取万墨 OS 服务环境";
     else if (state.scanning) status = "正在搜索局域网上位机…";
     else if (state.fresh) {
@@ -272,28 +335,59 @@ static void dashboard(void) {
         append(append(context, "正在连接  "), state.ip);
         status = context;
     } else if (state.discover_due) status = "暂未发现电脑，稍后重试";
-    unsigned footer = framed_box(1, 16, 330, 448, 79, CREAM);
+    unsigned footer = themed_box(theme, 16, 330, 448, 79);
     box(footer, 12, 12, 11, 11, state.fresh ? 0x339d50 : 0xca8a31, 0);
-    label(footer, 31, 6, 406, 26, 18, TEXT, DAWAN_TEXT_BOLD, state.message ? state.message : status);
+    label(footer, 31, 6, 406, 26, 18, theme->ink, DAWAN_TEXT_BOLD,
+          !preview && state.message ? state.message : status);
     if (state.fresh) {
         format_value(append(detail, "下载 "), metric(RX), " KiB/s");
         format_value(append(detail + length(detail), "    上传 "), metric(TX), " KiB/s");
-        label(footer, 12, 31, 420, 21, 15, MUTED, 0, detail);
+        label(footer, 12, 31, 420, 21, 15, theme->muted, 0, detail);
         unsigned minutes = state.metrics[UPTIME] / 60u;
         char *end = append(number(append(detail, "已运行 "), minutes / 60), "h ");
         append(number(end, minutes % 60), "m");
-        label(footer, 12, 52, 420, 21, 15, MUTED, 0, detail);
-    } else label(footer, 12, 38, 420, 26, 15, MUTED, 0, "请在电脑上启动 Windows 上位机");
+        label(footer, 12, 52, 420, 21, 15, theme->muted, 0, detail);
+    } else label(footer, 12, 38, 420, 26, 15, theme->muted, 0, "请在电脑上启动 Windows 上位机");
 
-    if (state.fresh && metric(CAN_SHUTDOWN) == 1 && !state.challenge && !state.send_shutdown &&
+    if (preview) {
+        if (state.theme_job != SAVE_THEME && state.pending != SAVE_THEME) {
+            button(16, 417, 216, 44, "安装", ACTION_GREEN, INSTALL_THEME);
+            button(248, 417, 216, 44, "取消", PANEL, BACK);
+        }
+    } else if (state.fresh && metric(CAN_SHUTDOWN) == 1 && !state.challenge && !state.send_shutdown &&
         state.pending != CHALLENGE && state.pending != SHUTDOWN) {
-        button(16, 417, 105, 44, "电脑", ACTION_GREEN, SETTINGS);
-        button(130, 417, 106, 44, "配对", ACTION_GOLD, EDIT_CODE);
-        button(244, 417, 106, 44, "关机", DANGER, ASK_SHUTDOWN);
-        button(359, 417, 105, 44, "退出", PANEL, EXIT);
+        button(16, 417, 83, 44, "电脑", ACTION_GREEN, SETTINGS);
+        button(107, 417, 89, 44, state.offered_theme && !same_theme_offer() ? "新主题" : "主题",
+               PANEL, OPEN_THEMES);
+        button(198, 417, 83, 44, "配对", ACTION_GOLD, EDIT_CODE);
+        button(289, 417, 83, 44, "关机", DANGER, ASK_SHUTDOWN);
+        button(380, 417, 84, 44, "退出", PANEL, EXIT);
     } else {
-        button(16, 417, 216, 44, "电脑", ACTION_GREEN, SETTINGS);
-        button(248, 417, 216, 44, "退出", PANEL, EXIT);
+        button(16, 417, 141, 44, "电脑", ACTION_GREEN, SETTINGS);
+        button(169, 417, 142, 44, state.offered_theme && !same_theme_offer() ? "新主题" : "主题",
+               ACTION_GOLD, OPEN_THEMES);
+        button(323, 417, 141, 44, "退出", PANEL, EXIT);
+    }
+}
+
+static void themes(void) {
+    char active[85];
+    title("监控屏主题", "返回", BACK);
+    append(append(active, "当前 · "), state.custom_theme ? state.installed_theme.name : builtin_theme.name);
+    label(1, 26, 105, 428, 42, 24, TEXT, DAWAN_TEXT_BOLD, active);
+    if (state.offered_theme) {
+        append(append(active, "已获取 · "), state.preview_theme.name);
+        label(1, 26, 165, 425, 32, 19, ACCENT, DAWAN_TEXT_BOLD, active);
+    } else label(1, 26, 165, 425, 32, 17, MUTED, 0, "在 Windows 上位机上传主题文件。");
+    label(1, 26, 210, 425, 32, 17, MUTED, 0, "预览后点「安装」即可保存到大万。");
+    if (state.theme_message)
+        label(1, 26, 268, 424, 36, 16, ACCENT, 0, state.theme_message);
+    if (state.theme_job == NONE && state.pending != FETCH_THEME && state.pending != SAVE_THEME) {
+        if (state.offered_theme) {
+            button(26, 332, 208, 54, "预览主题", ACTION_GREEN, PREVIEW_THEME);
+            button(26, 397, 208, 48, "重新获取", PANEL, GET_THEME);
+        } else button(26, 332, 208, 54, "获取主题", ACTION_GREEN, GET_THEME);
+        if (state.custom_theme) button(247, 332, 207, 54, "恢复内置", PANEL, RESET_THEME);
     }
 }
 
@@ -362,12 +456,16 @@ static int present(const dawan_app_host *host) {
         case DISCOVERY: discovery(); break;
         case PAIR: pair(); break;
         case CONFIRM: confirmation(); break;
+        case THEMES: themes(); break;
+        case THEME_PREVIEW: dashboard(); break;
     }
     const dawan_host *base = &host->ui.base;
     int result = host->ui.present(base->instance, state.revision + 1, state.nodes, state.nodes_used);
     if (result == DAWAN_BUSY) return DAWAN_OK;
     if (result != DAWAN_OK) return result;
     ++state.revision;
+    state.previous_screen = state.presented_screen;
+    state.presented_screen = state.screen;
     state.dirty = false;
     if (!state.presented) {
         state.presented = true;
@@ -409,6 +507,8 @@ static void select_address(const char *ip) {
     state.fresh = state.scanning = false;
     state.due = state.discover_due = 0;
     state.status_failures = 0;
+    state.theme_due = 0;
+    state.offered_theme = false;
     state.screen = DASHBOARD;
     state.message = 0;
     clear_key();
@@ -530,12 +630,19 @@ static void receive(const dawan_app_host *host, uint64_t now) {
     switch (kind) {
         case ENVIRONMENT:
             if (success && json_is(state.response, "\"environment_version\"", "1")) {
-                if (json_is(state.response, "\"environment\"", "\"test\"")) state.storage_key = "pc_ip_test";
-                if (json_is(state.response, "\"environment\"", "\"production\"")) state.storage_key = "pc_ip_prod";
+                if (json_is(state.response, "\"environment\"", "\"test\"")) {
+                    state.storage_key = "pc_ip_test";
+                    state.theme_key = "pc_theme_test";
+                }
+                if (json_is(state.response, "\"environment\"", "\"production\"")) {
+                    state.storage_key = "pc_ip_prod";
+                    state.theme_key = "pc_theme_prod";
+                }
             }
             state.ready = state.storage_key != 0;
             state.environment_error = !state.ready;
             state.load = state.ready;
+            if (state.ready) state.theme_job = LOAD_THEME;
             state.due = 0;
             report(base, state.ready ? "pc-status: service environment ready" : "pc-status: service environment unavailable");
             break;
@@ -549,6 +656,62 @@ static void receive(const dawan_app_host *host, uint64_t now) {
         }
         case SAVE_ADDRESS:
             if (!success && !state.message) state.message = "无法保存地址，本次仍可连接";
+            break;
+        case LOAD_THEME:
+            if (success && theme_parse(state.response, result.bytes, &state.installed_theme)) {
+                append(state.installed_wire, state.response);
+                state.custom_theme = true;
+                report(base, "pc-status: installed theme restored");
+            }
+            break;
+        case CHECK_THEME:
+        case FETCH_THEME: {
+            if (state.submitted_target != state.target || (kind == FETCH_THEME && state.screen != THEMES)) break;
+            if (kind == CHECK_THEME && state.screen == THEME_PREVIEW) break;
+            state.theme_due = now + 12000;
+            bool changed = !state.offered_theme || !starts(state.response, state.theme_wire) ||
+                           length(state.response) != length(state.theme_wire);
+            if (http_ok && theme_parse(state.response, result.bytes, &state.preview_theme)) {
+                append(state.theme_wire, state.response);
+                state.offered_theme = true;
+                if (changed) report(base, "pc-status: theme received and validated");
+                if (kind == FETCH_THEME) {
+                    state.theme_message = 0;
+                    state.screen = THEME_PREVIEW;
+                    report(base, "pc-status: theme preview ready");
+                }
+            } else if (kind == FETCH_THEME) {
+                char info[90];
+                char *end = number(append(info, "pc-status: theme fetch HTTP="), (unsigned)result.status);
+                end = append(end, result.result < 0 ? " result=-" : " result=");
+                end = number(end, result.result < 0 ? 0u - (unsigned)result.result : (unsigned)result.result);
+                number(append(end, " bytes="), result.bytes);
+                report(base, info);
+                if (success && result.status == 404) {
+                    state.offered_theme = false;
+                    state.theme_message = "上位机未提供主题，请先上传。";
+                } else state.theme_message = http_ok ? "主题格式无效。"
+                                                     : "获取失败，请检查上位机连接。";
+            } else if (success && result.status == 404) {
+                state.offered_theme = false;
+            }
+            break;
+        }
+        case SAVE_THEME:
+            if (!success) {
+                state.theme_message = "保存失败，可重试。当前主题仍在使用。";
+            } else {
+                if (state.reset_theme) state.installed_wire[0] = 0;
+                else {
+                    state.installed_theme = state.preview_theme;
+                    append(state.installed_wire, state.theme_wire);
+                }
+                state.custom_theme = !state.reset_theme;
+                state.message = 0;
+                state.screen = DASHBOARD;
+                report(base, state.custom_theme ? "pc-status: theme installed"
+                                                : "pc-status: builtin theme restored");
+            }
             break;
         case PROBE:
             if (!state.scanning || state.submitted_target != state.target) break;
@@ -609,7 +772,7 @@ static void receive(const dawan_app_host *host, uint64_t now) {
 
 static void submit(const dawan_app_host *host, enum job_kind kind, uint64_t now) {
     const dawan_host *base = &host->ui.base;
-    char address[16], url[80] = "", body[131] = "";
+    char address[16], url[80] = "", body[THEME_WIRE_MAX + 1] = "";
     const char *path = 0;
     dawan_job job = {
         .size = sizeof(job), .kind = DAWAN_HTTP, .timeout_ms = 2200, .response_limit = 1024,
@@ -627,6 +790,19 @@ static void submit(const dawan_app_host *host, enum job_kind kind, uint64_t now)
             job.kind = DAWAN_KV_PUT;
             job.key = state.storage_key;
             append(body, state.ip);
+            break;
+        case LOAD_THEME:
+            job.kind = DAWAN_KV_GET;
+            job.key = state.theme_key;
+            break;
+        case CHECK_THEME:
+        case FETCH_THEME:
+            job.response_limit = THEME_WIRE_MAX;
+            break;
+        case SAVE_THEME:
+            job.kind = DAWAN_KV_PUT;
+            job.key = state.theme_key;
+            append(body, state.reset_theme ? THEME_DEFAULT_RECORD : state.theme_wire);
             break;
         case PROBE:
             path = "identify";
@@ -650,12 +826,17 @@ static void submit(const dawan_app_host *host, enum job_kind kind, uint64_t now)
         append(append(append(append(url, "http://"), address), PORT API), path);
         job.method = job.bytes ? "POST" : "GET";
         job.response_limit = 256;
+    } else if (kind == CHECK_THEME || kind == FETCH_THEME) {
+        append(append(append(url, "http://"), address), PORT "/wm-pc/v2/theme");
+        job.method = "GET";
     }
     int result = host->jobs->submit(base->instance, &job);
     pc_wipe(body, sizeof(body));
     if (result == DAWAN_BUSY) return;
+    if (kind == CHECK_THEME || kind == FETCH_THEME) state.theme_due = now + 12000;
     if (kind == LOAD_ADDRESS) state.load = false;
     if (kind == SAVE_ADDRESS) state.save = false;
+    if (kind == state.theme_job) state.theme_job = NONE;
     if (kind == CHALLENGE) state.challenge = false;
     if (kind == SHUTDOWN) state.send_shutdown = false;
     if (result == DAWAN_OK) {
@@ -680,6 +861,11 @@ static void submit(const dawan_app_host *host, enum job_kind kind, uint64_t now)
             if (state.status_failures < 2) ++state.status_failures;
             break;
         case CHALLENGE: case SHUTDOWN: state.message = "关机请求提交失败"; break;
+        case FETCH_THEME:
+            state.theme_message = "获取主题失败，请重试。";
+            report(base, "pc-status: theme request rejected by host");
+            break;
+        case SAVE_THEME: state.theme_message = "无法保存主题，请重试。"; break;
         default: break;
     }
     state.dirty = true;
@@ -691,6 +877,17 @@ static void touch(const dawan_streaming_host *host, unsigned action, uint64_t no
     state.dirty = true;
     switch (state.screen) {
         case DASHBOARD:
+            if (action == OPEN_THEMES && state.ready && !state.control_sent && !state.challenge &&
+                !state.send_shutdown && state.pending != CHALLENGE) {
+                state.scanning = false;
+                state.screen = THEMES;
+                state.theme_message = 0;
+                if (!state.offered_theme && state.have_address && state.pending != CHECK_THEME &&
+                    state.theme_job == NONE) {
+                    state.theme_job = FETCH_THEME;
+                    state.theme_message = "正在获取主题…";
+                }
+            }
             if (action == SETTINGS && state.ready && !state.control_sent && !state.challenge &&
                 !state.send_shutdown && state.pending != CHALLENGE) {
                 state.screen = DISCOVERY;
@@ -769,6 +966,39 @@ static void touch(const dawan_streaming_host *host, unsigned action, uint64_t no
                 state.screen = DASHBOARD;
             }
             break;
+        case THEMES:
+            if (state.pending == SAVE_THEME || state.theme_job == SAVE_THEME) break;
+            if (action == BACK) {
+                if (state.theme_job == FETCH_THEME) state.theme_job = NONE;
+                if (state.pending == FETCH_THEME) ++state.target;
+                state.screen = DASHBOARD;
+            } else if (state.theme_job == NONE && state.pending != FETCH_THEME) {
+                if (action == PREVIEW_THEME && state.offered_theme) {
+                    state.screen = THEME_PREVIEW;
+                    state.theme_message = 0;
+                } else if (action == GET_THEME) {
+                    if (state.have_address) {
+                        state.theme_job = FETCH_THEME;
+                        state.theme_message = "正在获取主题…";
+                    } else state.theme_message = "请先连接电脑上位机。";
+                } else if (action == RESET_THEME && state.custom_theme) {
+                    state.reset_theme = true;
+                    state.theme_job = SAVE_THEME;
+                    state.theme_message = "正在恢复内置主题…";
+                }
+            }
+            break;
+        case THEME_PREVIEW:
+            if (state.pending == SAVE_THEME || state.theme_job == SAVE_THEME) break;
+            if (action == BACK) {
+                state.screen = THEMES;
+                state.theme_message = 0;
+            } else if (action == INSTALL_THEME) {
+                state.reset_theme = false;
+                state.theme_job = SAVE_THEME;
+                state.theme_message = "正在保存…";
+            }
+            break;
     }
 }
 
@@ -831,20 +1061,25 @@ int32_t dawan_main(const dawan_host *base, uint32_t event) {
             report(base, "pc-status: square canvas accepted");
         } else report(base, "pc-status: square design fitted to landscape SDK canvas");
         state.dirty = true;
+        report(base, "pc-status: device version 2.0.2");
         return DAWAN_OK;
     }
     if (event != DAWAN_TICK || state.stopping) return DAWAN_OK;
     dawan_system system = {.size = sizeof(system)};
     if (host->system(base->instance, &system) != DAWAN_OK) return DAWAN_OK;
     uint64_t now = system.monotonic_ms;
-    if (state.screen == DASHBOARD) refresh_clock(host, &system);
+    if (state.screen == DASHBOARD || state.screen == THEME_PREVIEW) refresh_clock(host, &system);
     if (state.screen == CONFIRM && now >= state.confirm_until) {
         state.screen = DASHBOARD;
         state.dirty = true;
     }
     dawan_ui_event click = {.size = sizeof(click)};
     for (unsigned n = 0; n < 8 && host->ui.poll(base->instance, &click) == DAWAN_OK; ++n) {
-        if (click.revision != state.revision) continue;
+        bool theme_navigation = click.action == OPEN_THEMES || click.action == GET_THEME ||
+                                click.action == PREVIEW_THEME;
+        bool same_page = state.revision > 1 && click.revision == state.revision - 1 &&
+                         state.previous_screen == state.presented_screen && state.screen == state.presented_screen;
+        if (click.revision != state.revision && !(theme_navigation && same_page)) continue;
         if (state.screen == DASHBOARD && click.action == EXIT) return DAWAN_CANCELLED;
         enum page previous = state.screen;
         touch(streaming, click.action, now);
@@ -854,6 +1089,11 @@ int32_t dawan_main(const dawan_host *base, uint32_t event) {
     if (!(system.flags & 2u)) {
         if (state.fresh) state.dirty = true;
         state.fresh = false;
+        if (state.theme_job == FETCH_THEME) {
+            state.theme_job = NONE;
+            state.theme_message = "大万未联网，请连接网络后重试。";
+            state.dirty = true;
+        }
         if (state.challenge || state.send_shutdown) {
             state.challenge = state.send_shutdown = false;
             state.message = "大万已断网，关机请求未发送";
@@ -864,17 +1104,23 @@ int32_t dawan_main(const dawan_host *base, uint32_t event) {
         if (!state.ready && !state.environment_error && now >= state.due) submit(host, ENVIRONMENT, now);
         else if (state.load) submit(host, LOAD_ADDRESS, now);
         else if (state.save) submit(host, SAVE_ADDRESS, now);
+        else if (state.theme_job == LOAD_THEME || state.theme_job == SAVE_THEME)
+            submit(host, state.theme_job, now);
         else if (system.flags & 2u) {
             if (state.send_shutdown) submit(host, SHUTDOWN, now);
             else if (state.challenge) submit(host, CHALLENGE, now);
+            else if (state.theme_job == FETCH_THEME) submit(host, FETCH_THEME, now);
             else if (state.ready && (state.screen == DASHBOARD || state.screen == DISCOVERY)) {
                 if (state.screen == DASHBOARD && !state.scanning &&
                     (!state.have_address || state.status_failures >= 2) && now >= state.discover_due)
                     search_known_network(true, now);
                 if (state.scanning) submit(host, PROBE, now);
-                else if (state.screen == DASHBOARD && state.have_address && now >= state.due)
-                    submit(host, STATUS, now);
-            }
+                else if (state.screen == DASHBOARD && state.have_address) {
+                    if (now >= state.due) submit(host, STATUS, now);
+                    else if (state.fresh && now >= state.theme_due) submit(host, CHECK_THEME, now);
+                }
+            } else if (state.screen == THEME_PREVIEW && state.have_address && now >= state.due)
+                submit(host, STATUS, now);
         }
     }
     return state.dirty ? present(host) : DAWAN_OK;

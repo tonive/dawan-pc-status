@@ -39,6 +39,8 @@ python .\tools\install_dev_package.py "C:\Downloads\dawan_pc_status.zip" --app d
 
 上位机监听所选地址的 TCP `47831`。如果专用网络上的 Windows 防火墙拦截连接，可为该上位机开放专用网络入站访问。监控指标经局域网 HTTP 传输，适合可信私人网络。
 
+2.0 可以在同一连接上传主题。安装和使用方法见 [自制主题和安装 Skill](themes.md)。
+
 ## 预约关机
 
 1. 在上位机勾选「允许大万预约关机」。

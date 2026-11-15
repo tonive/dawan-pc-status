@@ -10,14 +10,21 @@ import re
 import secrets
 import socket
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psutil
 
+skill_scripts = Path(__file__).resolve().parent / "skills" / "dawan-pc-theme" / "scripts"
+if skill_scripts.is_dir():
+    sys.path.insert(0, str(skill_scripts))
+from dawan_theme import load_theme
+
 
 PORT = 47831
+VERSION = "2.0.2"
 ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 NONCE = re.compile(rb"[0-9a-f]{32}")
 PROOF = re.compile(rb"[0-9a-f]{64}")
@@ -58,6 +65,7 @@ class Companion:
         self.allowed = False
         self.deadline = None
         self.metrics = None
+        self.theme = None
         self.disk = str(Path(os.environ.get("SystemDrive", "C:") + "\\"))
         candidates = (windows_path("System32", "nvidia-smi.exe"),
                       Path(os.environ.get("ProgramFiles", r"C:\Program Files")) /
@@ -107,6 +115,14 @@ class Companion:
 
     def sign(self, kind, client, server):
         return hmac.new(self.key, b" ".join((b"WMPC1", kind, client, server)), hashlib.sha256).hexdigest().encode()
+
+    def offer_theme(self, theme):
+        with self.lock:
+            self.theme = theme
+
+    def theme_offer(self):
+        with self.lock:
+            return self.theme
 
     def challenge(self, client):
         with self.lock:
@@ -165,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def reply(self, status, payload=b""):
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -178,6 +194,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/wm-pc/v1/status":
             status = app.status()
             self.reply(200, status) if status else self.reply(503)
+        elif self.path == "/wm-pc/v2/theme":
+            theme = app.theme_offer()
+            self.reply(200, theme) if theme else self.reply(404)
         else:
             self.reply(404)
 
@@ -223,7 +242,6 @@ class Server(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         # Disconnected discovery probes are expected on a network.
-        import sys
         if not isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
             super().handle_error(request, client_address)
 
@@ -234,12 +252,12 @@ def sample_until_stopped(app, stop):
         app.sample()
 
 
-def window(initial_address=None):
+def window(initial_address=None, initial_theme=None):
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("大万状态监控屏 · Windows 上位机")
+    root.title(f"大万状态监控屏 {VERSION} · Windows 上位机")
     root.resizable(False, False)
     panel = ttk.Frame(root, padding=24)
     panel.grid(sticky="nsew")
@@ -253,6 +271,8 @@ def window(initial_address=None):
     status = tk.StringVar(value="服务尚未启动")
     code = tk.StringVar(value="启动服务并允许关机后显示")
     stats = tk.StringVar(value="")
+    theme_status = tk.StringVar(value="先启动服务，再选择主题文件。")
+    offered_theme = initial_theme
     server = app = stop_event = None
 
     def refresh():
@@ -271,6 +291,28 @@ def window(initial_address=None):
             app.cancel()
             status.set("已取消计划关机")
 
+    def upload_theme():
+        nonlocal offered_theme
+        filename = filedialog.askopenfilename(parent=root, title="选择大万主题",
+                                               filetypes=[("大万主题", "*.wmtheme.json"), ("JSON", "*.json")])
+        if not filename:
+            return
+        try:
+            offered_theme = load_theme(filename)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("主题上传失败", str(error), parent=root)
+            return
+        publish_theme()
+
+    def publish_theme():
+        if offered_theme:
+            value, wire = offered_theme
+            app.offer_theme(wire)
+            prompt = "请在 2.0.2 或更新的大万监控屏上预览。" if value["version"] == 2 else "请在大万上获取并安装。"
+            theme_status.set(f"「{value['name']}」已上传。{prompt}")
+        else:
+            theme_status.set("可导入 .wmtheme.json 主题文件。")
+
     def stop():
         nonlocal server, app, stop_event
         if server:
@@ -282,6 +324,8 @@ def window(initial_address=None):
         enabled.set(False)
         permission.configure(state="disabled")
         abort.configure(state="disabled")
+        theme_button.configure(state="disabled")
+        theme_status.set("服务已停止。")
         choices.configure(state="readonly")
         reload_button.configure(state="normal")
         toggle.configure(text="启动服务")
@@ -307,12 +351,14 @@ def window(initial_address=None):
         threading.Thread(target=sample_until_stopped, args=(app, stop_event), daemon=True).start()
         threading.Thread(target=server.serve_forever, daemon=True).start()
         permission.configure(state="normal")
+        theme_button.configure(state="normal")
         choices.configure(state="disabled")
         reload_button.configure(state="disabled")
         toggle.configure(text="停止服务")
         parts = address.get().split(".")
         status.set(f"服务已启动 · {address.get()}\n大万可搜索网段 {'.'.join(parts[:3])}，或直连完整 IP。")
         permit()
+        publish_theme()
 
     def tick():
         if app:
@@ -347,6 +393,10 @@ def window(initial_address=None):
     ttk.Label(panel, textvariable=status, wraplength=380).grid(row=8, columnspan=3, sticky="w")
     abort = ttk.Button(panel, text="取消关机", command=cancel, state="disabled")
     abort.grid(row=9, columnspan=3, sticky="e", pady=(12, 0))
+    ttk.Separator(panel).grid(row=10, columnspan=3, pady=(15, 12), sticky="ew")
+    theme_button = ttk.Button(panel, text="上传主题…", command=upload_theme, state="disabled")
+    theme_button.grid(row=11, columnspan=3, sticky="w")
+    ttk.Label(panel, textvariable=theme_status, wraplength=380).grid(row=12, columnspan=3, sticky="w", pady=(5, 0))
 
     def close():
         stop()
@@ -369,12 +419,20 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--serve", metavar="PRIVATE_IP", help="Run monitoring only on the specified IPv4")
     modes.add_argument("--start", metavar="PRIVATE_IP", help="Open the window and start monitoring on this IPv4")
+    parser.add_argument("--theme", type=Path, help="Offer a validated .wmtheme.json when starting the service")
+    parser.add_argument("--version", action="version", version=VERSION)
     arguments = parser.parse_args()
+    try:
+        theme = load_theme(arguments.theme) if arguments.theme else None
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     if not arguments.serve:
-        return window(arguments.start)
+        return window(arguments.start, theme)
     if not private(arguments.serve):
         parser.error("--serve requires a private IPv4")
     app = Companion()
+    if theme:
+        app.offer_theme(theme[1])
     stop = threading.Event()
     with Server(arguments.serve, app) as server:
         threading.Thread(target=sample_until_stopped, args=(app, stop), daemon=True).start()

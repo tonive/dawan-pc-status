@@ -1,0 +1,22 @@
+{
+  "format": "dawan-pc-theme",
+  "version": 1,
+  "name": "极光终端",
+  "title": "极光监控",
+  "style": "panel",
+  "layout": "rows",
+  "meter": "solid",
+  "palette": {
+    "background": "#080F1F",
+    "surface": "#121F32",
+    "ink": "#F1F6FF",
+    "muted": "#AFBDD2",
+    "outline": "#345069"
+  },
+  "cards": [
+    { "metric": "cpu", "icon": "none", "accent": "#6BE6DA", "banner": "#173345" },
+    { "metric": "memory", "icon": "none", "accent": "#B6EE9C", "banner": "#214438" },
+    { "metric": "gpu", "icon": "none", "accent": "#BAA8FE", "banner": "#382F62" },
+    { "metric": "disk", "icon": "none", "accent": "#FFD081", "banner": "#483B2B" }
+  ]
+}

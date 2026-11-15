@@ -21,13 +21,14 @@ python -B "$sdk/skills/wanmo-app-dev/scripts/package_app.py" --kind elf --sdk-ro
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install psutil==7.2.2 pyinstaller==6.20.0
-.\.venv\Scripts\python.exe -m PyInstaller --onefile --windowed --name DawanPCMonitor --distpath delivery --workpath .build/pyi --specpath .build host.py
+.\.venv\Scripts\python.exe -m PyInstaller --onefile --windowed --name DawanPCMonitor --paths skills/dawan-pc-theme/scripts --distpath delivery --workpath .build/pyi --specpath .build host.py
 ```
 
 ## 验证
 
 - 官方 ELF 工具检查 ABI、SDK 能力清单、文件摘要及 ZIP 内容。
 - 上位机测试通过回环接口检查发现、实时指标、C/Python HMAC 一致性、关机预约、过期、重放与取消。测试不会调用 Windows 关机。
+- 上位机测试也检查主题文件约束、发布前后的主题响应及样例编码。
 - 最终用大万开发安装工具测试加载和退出，并在设备上检查首次连接、读数刷新及触控。安装方法见 [操作指南](user-guide.md)。
 
 在本机 MinGW 的 GCC 环境执行上位机协议测试。
